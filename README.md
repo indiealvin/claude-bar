@@ -1,16 +1,17 @@
 <p align="center">
-  <img src="docs/icon.png" alt="UsageBar icon" width="112">
+  <img src="docs/icon.png" alt="claude-bar icon" width="112">
 </p>
 
-<h1 align="center">UsageBar</h1>
+<h1 align="center">claude-bar</h1>
 
 <p align="center">
-  A macOS menu bar app that shows your Claude subscription usage: the 5-hour and weekly limits.<br>
+  A macOS menu bar app that shows your Claude subscription usage: the 5-hour and weekly limits, plus
+  per-model weekly limits such as Fable.<br>
   No passwords, cookies or API keys. No network access, Keychain, or Accessibility permission.
 </p>
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="UsageBar popover showing 5-hour and weekly usage with menu bar display settings" width="306">
+  <img src="docs/screenshot.png" alt="claude-bar popover showing 5-hour and weekly usage with menu bar display settings" width="306">
 </p>
 
 ## Requirements
@@ -40,14 +41,14 @@ To start it at login, add it under **System Settings → General → Login Items
 ## How it works
 
 ```
-Claude Code ──status line JSON──▶ usagebar-hook ──▶ ~/.claude/usage-bar.json ──▶ UsageBar (menu bar)
+Claude Code ──status line JSON──▶ usagebar-hook ──▶ ~/.claude/usage-bar.json ──▶ claude-bar (menu bar)
                                        │
                                        └──▶ your own status line command, output passed back unchanged
 ```
 
 Claude Code runs a [status line](https://docs.claude.com/en/docs/claude-code/statusline) command after
 each reply and passes it JSON on stdin. For subscribers, that JSON includes `rate_limits`: the used
-percentage and reset time of the 5-hour and weekly windows. UsageBar never asks Claude for anything; it
+percentage and reset time of the 5-hour and weekly windows. claude-bar never asks Claude for anything; it
 only picks up what Claude Code already has.
 
 **Connect** does three things:
@@ -72,6 +73,11 @@ Each time Claude Code runs the helper, it:
 The app checks `~/.claude/usage-bar.json` every few seconds. It needs no permissions and makes no
 network requests.
 
+Per-model weekly limits, which `/usage` lists as *Current week (Fable)*, aren't in the status line JSON
+(checked against Claude Code 2.1.284). For those, claude-bar reads the usage data Claude Code caches for
+itself in `~/.claude.json` (`cachedUsageUtilization`) and shows a *Weekly (Fable)* row. Claude Code
+refreshes that cache mainly when you run `/usage`, so the row says how old its numbers are.
+
 **Disconnect** puts your original `statusLine` setting back and removes `~/.claude/usagebar/`.
 
 ## Display options
@@ -92,7 +98,8 @@ The footer shows the build version and commit, for example `v0.1.0 · 2e3bc52`.
 | Connect to Claude Code | Click **Connect**. |
 | Waiting for Claude Code | Send a prompt in Claude Code. Sessions that were already open may need restarting to pick up the new status line. |
 | No usage limits reported | Claude Code ran the helper but sent no limits. Sign in with a Pro or Max plan (`/login`) instead of an API key, and update Claude Code. |
-| Error about `settings.json` | The file isn't valid JSON, so UsageBar didn't change it. Fix the file and click **Connect** again. |
+| Error about `settings.json` | The file isn't valid JSON, so claude-bar didn't change it. Fix the file and click **Connect** again. |
+| No *Weekly (Fable)* row | Run `/usage` in Claude Code once. Per-model rows come from the usage data Claude Code caches when `/usage` runs, and only accounts with a per-model weekly limit have one. |
 
 Numbers only update while Claude Code is running. Usage on claude.ai counts toward the same limits, but
 it shows up the next time Claude Code refreshes. A window whose reset time has passed shows `–` until new
