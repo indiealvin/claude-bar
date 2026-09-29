@@ -14,10 +14,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: snapshot hook
         run: |
-          # The hook must keep only rate_limits and write nothing when they are absent.
+          # The script must keep only rate_limits and write nothing when they are absent.
           export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME/.claude"
           echo '{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1}}}' | sh scripts/usage-snapshot.sh
           jq -e '.rate_limits.five_hour.used_percentage == 42 and (has("session_id") | not)' "$HOME/.claude/usage-bar.json"
+          # A re-render (same session, same api time) must not overwrite; the next reply must.
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":100},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1}}}' | sh scripts/usage-snapshot.sh
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":100},"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1}}}' | sh scripts/usage-snapshot.sh
+          jq -e '.rate_limits.five_hour.used_percentage == 50' "$HOME/.claude/usage-bar.json"
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":250},"rate_limits":{"five_hour":{"used_percentage":60,"resets_at":1}}}' | sh scripts/usage-snapshot.sh
+          jq -e '.rate_limits.five_hour.used_percentage == 60' "$HOME/.claude/usage-bar.json"
+          # Markers are named by a hash, never the session ID, and hold only the api time.
+          test "$(ls "$HOME/.claude/usagebar/sessions")" = "$(printf s | shasum -a 256 | cut -c1-16)"
+          test "$(cat "$HOME"/.claude/usagebar/sessions/*)" = 250
           rm "$HOME/.claude/usage-bar.json"
           echo '{"session_id":"s"}' | sh scripts/usage-snapshot.sh
           test ! -e "$HOME/.claude/usage-bar.json"
@@ -34,7 +43,19 @@ jobs:
           out=$(echo '{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1}}}' | "$hook")
           test "$out" = ORIGINAL
           jq -e '.rate_limits.five_hour.used_percentage == 42 and (tostring | contains("session_id") | not)' "$HOME/.claude/usage-bar.json"
-          jq -e '.had_rate_limits == true' "$HOME/.claude/usagebar/last-run.json"
+          jq -e '.had_rate_limits == true and .wrote_snapshot == true' "$HOME/.claude/usagebar/last-run.json"
+          # A re-render (same session, same api time) must not overwrite; the next reply must.
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":100},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1}}}' | "$hook" >/dev/null
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":100},"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1}}}' | "$hook" >/dev/null
+          jq -e '.rate_limits.five_hour.used_percentage == 50' "$HOME/.claude/usage-bar.json"
+          jq -e '.had_rate_limits == true and .wrote_snapshot == false' "$HOME/.claude/usagebar/last-run.json"
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":250},"rate_limits":{"five_hour":{"used_percentage":60,"resets_at":1}}}' | "$hook" >/dev/null
+          jq -e '.rate_limits.five_hour.used_percentage == 60' "$HOME/.claude/usage-bar.json"
+          # The same marker the script uses, so a status line that runs both writes once.
+          test "$(ls "$HOME/.claude/usagebar/sessions")" = "$(printf s | shasum -a 256 | cut -c1-16)"
+          test "$(cat "$HOME"/.claude/usagebar/sessions/*)" = 250
+          echo '{"session_id":"s","cost":{"total_api_duration_ms":250},"rate_limits":{"five_hour":{"used_percentage":70,"resets_at":1}}}' | sh scripts/usage-snapshot.sh
+          jq -e '.rate_limits.five_hour.used_percentage == 60' "$HOME/.claude/usage-bar.json"
           echo '{"session_id":"s"}' | "$hook" >/dev/null
           jq -e '.had_rate_limits == false' "$HOME/.claude/usagebar/last-run.json"
           # A status line that never reads stdin closes the pipe early; the hook must still succeed.

@@ -7,7 +7,7 @@
 <p align="center">
   A macOS menu bar app that shows your Claude subscription usage: the 5-hour and weekly limits, plus
   per-model weekly limits such as Fable.<br>
-  No passwords, cookies or API keys. No network access, Keychain, or Accessibility permission.
+  No passwords, cookies or API keys. By default no network access, Keychain or Accessibility permission.
 </p>
 
 <p align="center">
@@ -63,22 +63,51 @@ only picks up what Claude Code already has.
 Each time Claude Code runs the helper, it:
 
 - saves only the two windows' `used_percentage` and `resets_at`, plus a timestamp, to
-  `~/.claude/usage-bar.json`. Nothing else from the status line input, such as paths or session IDs, is
-  written;
-- records in `~/.claude/usagebar/last-run.json` that it ran and whether limits were present. The app uses
-  this to tell "waiting for Claude Code" apart from "Claude Code isn't reporting limits";
+  `~/.claude/usage-bar.json`, and only when this session has completed a reply since its last write.
+  Claude Code also re-renders the status line on a timer, after `/usage` and when a setting changes,
+  repeating the rate-limit headers of the session's *last* reply, and an idle session must not overwrite
+  a fresher snapshot from another one. The helper tells the two apart by the session's API time in the
+  status line input, remembered per session in `~/.claude/usagebar/sessions/` under a short hash of the
+  session ID. Nothing else from the input, such as paths or the session ID itself, is written;
+- records in `~/.claude/usagebar/last-run.json` that it ran, whether limits were present and whether it
+  wrote. The app uses this to tell "waiting for Claude Code" apart from "Claude Code isn't reporting
+  limits";
 - runs your previous status line command with the same input and prints its output, so your status line
   looks exactly as before. If you had none, it prints nothing.
 
-The app checks `~/.claude/usage-bar.json` every few seconds. It needs no permissions and makes no
-network requests.
+The app checks `~/.claude/usage-bar.json` every few seconds. It needs no permissions and, unless you turn
+on [fetching usage directly](#fetching-usage-directly), makes no network requests.
 
-Per-model weekly limits, which `/usage` lists as *Current week (Fable)*, aren't in the status line JSON
-(checked against Claude Code 2.1.284). For those, claude-bar reads the usage data Claude Code caches for
-itself in `~/.claude.json` (`cachedUsageUtilization`) and shows a *Weekly (Fable)* row. Claude Code
-refreshes that cache mainly when you run `/usage`, so the row says how old its numbers are.
+claude-bar also reads the usage data Claude Code caches for itself in `~/.claude.json`
+(`cachedUsageUtilization`), which Claude Code refreshes mainly when you run `/usage`. It is the only place
+the per-model weekly limits appear (the status line JSON has none, as of Claude Code 2.1.284), so the
+*Weekly (Fable)* row comes from it alone. It also carries the 5-hour and weekly numbers, and for those two
+rows the popover shows whichever source is newer, the snapshot or the cache. The two measure a few points
+apart, so a row matches `/usage` right after it runs and moves to the status line's number on the next
+reply. The footer shows when each source last updated.
 
 **Disconnect** puts your original `statusLine` setting back and removes `~/.claude/usagebar/`.
+
+## Fetching usage directly
+
+Everything above only updates when Claude Code runs on this Mac. If you use Claude Code on another host,
+over SSH for example, turn on **Fetch usage every 5 min** in the popover. The app then asks Anthropic for
+your usage every 5 minutes, the same request `/usage` makes. Usage belongs to your account, so this covers
+every host, and the numbers match `/usage`, per-model rows included.
+
+It is off by default because it changes what the app touches:
+
+- It reads the login Claude Code keeps on this Mac, from the Keychain item `Claude Code-credentials`
+  through `/usr/bin/security` as Claude Code does, or from `~/.claude/.credentials.json`. The token is
+  held in memory for the request and sent only to `api.anthropic.com`.
+- It never renews the login, since that could sign Claude Code out. The login expires after a few hours
+  unless Claude Code on this Mac runs and renews it. Until then the popover says so and shows the other
+  sources.
+- The endpoint is the one Claude Code uses internally and isn't documented, so a Claude Code update could
+  change it. A 429 from Anthropic pauses fetching for 15 minutes.
+
+Each row shows whichever source is newest: a direct fetch, the status line, or the `/usage` cache. The
+footer shows how old each one is.
 
 ## Display options
 
@@ -99,11 +128,13 @@ The footer shows the build version and commit, for example `v0.1.0 · 2e3bc52`.
 | Waiting for Claude Code | Send a prompt in Claude Code. Sessions that were already open may need restarting to pick up the new status line. |
 | No usage limits reported | Claude Code ran the helper but sent no limits. Sign in with a Pro or Max plan (`/login`) instead of an API key, and update Claude Code. |
 | Error about `settings.json` | The file isn't valid JSON, so claude-bar didn't change it. Fix the file and click **Connect** again. |
-| No *Weekly (Fable)* row | Run `/usage` in Claude Code once. Per-model rows come from the usage data Claude Code caches when `/usage` runs, and only accounts with a per-model weekly limit have one. |
+| Claude Code's login on this Mac has expired | Fetching usage directly is on, and the access token it borrows from Claude Code has expired. Run `claude` on this Mac once; fetching resumes within a minute. |
+| No *Weekly (Fable)* row | Turn on **Fetch usage every 5 min**, or run `/usage` in Claude Code once. Per-model rows come from the usage data Claude Code caches when `/usage` runs, and only accounts with a per-model weekly limit have one. |
 
 Numbers only update while Claude Code is running. Usage on claude.ai counts toward the same limits, but
 it shows up the next time Claude Code refreshes. A window whose reset time has passed shows `–` until new
-data arrives.
+data arrives. If the popover trails `/usage` by a few percent, run `/usage` once: its numbers take over
+until the next reply.
 
 ## Manual setup
 
