@@ -14,27 +14,86 @@ struct Snapshot: Decodable {
     let captured_at: TimeInterval
 }
 
+// The parts of ~/.claude.json UsageBar reads: Claude Code's cache of its /usage endpoint. Every field
+// is optional so a row of an unexpected shape drops out instead of failing the whole decode.
+struct ClaudeConfig: Decodable {
+    struct UsageCache: Decodable {
+        struct Limit: Decodable {
+            struct Scope: Decodable {
+                struct Model: Decodable {
+                    let display_name: String?
+                }
+                let model: Model?
+            }
+            let kind: String?
+            let percent: Double?
+            let resets_at: String?
+            let scope: Scope?
+        }
+        struct Utilization: Decodable {
+            let limits: [Limit]?
+        }
+        let fetchedAtMs: Double
+        let utilization: Utilization?
+
+        /// The per-model weekly windows, as /usage lists them under "Current week (<model>)".
+        var modelWindows: [ModelWindow] {
+            let fetchedAt = Date(timeIntervalSince1970: fetchedAtMs / 1000)
+            return (utilization?.limits ?? []).compactMap { limit in
+                guard limit.kind == "weekly_scoped", let percent = limit.percent,
+                      let name = limit.scope?.model?.display_name, !name.isEmpty else { return nil }
+                return ModelWindow(name: name, percent: percent,
+                                   resetsAt: limit.resets_at.flatMap(parseISODate)?.timeIntervalSince1970,
+                                   fetchedAt: fetchedAt)
+            }
+        }
+    }
+    let cachedUsageUtilization: UsageCache?
+}
+
+/// A weekly window for one model, e.g. Fable, from Claude Code's cached /usage data.
+struct ModelWindow: Identifiable {
+    let name: String
+    let percent: Double
+    /// Nil when Claude Code reported no reset time for the window.
+    let resetsAt: TimeInterval?
+    /// When Claude Code fetched the numbers, usually the last time /usage ran.
+    let fetchedAt: Date
+    var id: String { "\(name)@\(resetsAt ?? 0)" }
+}
+
+/// Claude Code writes "2026-09-30T12:00:00.016111+00:00". ISO8601DateFormatter only reliably parses
+/// three fractional digits, so the fraction is dropped first.
+func parseISODate(_ s: String) -> Date? {
+    let whole = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+    return ISO8601DateFormatter().date(from: whole)
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     static let fileURL = ClaudeSetup.claudeDir.appendingPathComponent("usage-bar.json")
 
     @Published var snapshot: Snapshot?
+    @Published var modelWindows: [ModelWindow] = []
     @Published var now = Date()
     @Published var connected = ClaudeSetup.isConnected
     @Published var lastRun = ClaudeSetup.lastRun
     @Published var setupError: String?
     private var lastModified: Date?
+    private var claudeJSONModified: Date?
     private var timer: Timer?
 
     init() {
         ClaudeSetup.refreshHookIfNeeded()
         reload()
+        reloadModelWindows()
         // Polling a single small file is cheap and survives the hook's atomic rename,
         // which would break a file-descriptor based watcher.
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.now = Date()
                 self?.reload()
+                self?.reloadModelWindows()
                 self?.connected = ClaudeSetup.isConnected
                 self?.lastRun = ClaudeSetup.lastRun
             }
@@ -48,6 +107,19 @@ final class UsageStore: ObservableObject {
         lastModified = modified
         guard let data = try? Data(contentsOf: Self.fileURL) else { snapshot = nil; return }
         snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
+    }
+
+    /// Per-model weekly windows from Claude Code's cached /usage data in ~/.claude.json.
+    func reloadModelWindows() {
+        let url = ClaudeSetup.claudeJSONURL
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modified = attrs?[.modificationDate] as? Date
+        guard modified != claudeJSONModified else { return }
+        claudeJSONModified = modified
+        guard let data = try? Data(contentsOf: url) else { modelWindows = []; return }
+        // Claude Code rewrites this file often; a read that lands mid-write keeps the last good value.
+        guard let config = try? JSONDecoder().decode(ClaudeConfig.self, from: data) else { return }
+        modelWindows = config.cachedUsageUtilization?.modelWindows ?? []
     }
 
     func connect() {
@@ -75,6 +147,11 @@ final class UsageStore: ObservableObject {
     func live(_ w: Snapshot.Window?) -> Snapshot.Window? {
         guard let w, w.resets_at > now.timeIntervalSince1970 else { return nil }
         return w
+    }
+
+    /// Model windows still in their window; one with no reset time is kept.
+    var liveModelWindows: [ModelWindow] {
+        modelWindows.filter { $0.resetsAt.map { $0 > now.timeIntervalSince1970 } ?? true }
     }
 
     /// The windows chosen in settings, paired with their short labels.
@@ -239,27 +316,49 @@ func relative(_ date: Date, to now: Date) -> String {
 
 struct WindowRow: View {
     let label: String
-    let window: Snapshot.Window?
+    let percent: Double?
+    let resetsAt: TimeInterval?
     let now: Date
+    /// Where the numbers came from, when it isn't the status line.
+    let source: String?
+
+    init(label: String, window: Snapshot.Window?, now: Date) {
+        self.init(label: label, percent: window?.used_percentage, resetsAt: window?.resets_at, now: now)
+    }
+
+    init(label: String, percent: Double?, resetsAt: TimeInterval?, now: Date, source: String? = nil) {
+        self.label = label
+        self.percent = percent
+        self.resetsAt = resetsAt
+        self.now = now
+        self.source = source
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(label).font(.headline)
                 Spacer()
-                Text(window.map { "\(Int($0.used_percentage.rounded()))%" } ?? "–")
+                Text(percent.map { "\(Int($0.rounded()))%" } ?? "–")
                     .monospacedDigit()
             }
-            ProgressView(value: min(window?.used_percentage ?? 0, 100), total: 100)
+            ProgressView(value: min(percent ?? 0, 100), total: 100)
                 .tint(tint)
-            Text(window.map { "Resets \(relative(Date(timeIntervalSince1970: $0.resets_at), to: now))" }
-                 ?? "Window reset or not reported yet")
+            Text(caption)
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
 
+    private var caption: String {
+        var parts: [String] = []
+        if let resetsAt { parts.append("Resets \(relative(Date(timeIntervalSince1970: resetsAt), to: now))") }
+        if let source { parts.append(source) }
+        if parts.isEmpty { return percent == nil ? "Window reset or not reported yet" : "No reset time reported" }
+        return parts.joined(separator: " · ")
+    }
+
     private var tint: Color {
-        switch window?.used_percentage ?? 0 {
+        switch percent ?? 0 {
         case ..<60: return .green
         case ..<85: return .orange
         default: return .red
@@ -312,6 +411,12 @@ struct UsageMenu: View {
             if let s = store.snapshot {
                 WindowRow(label: "5-hour", window: store.live(s.rate_limits.five_hour), now: store.now)
                 WindowRow(label: "Weekly", window: store.live(s.rate_limits.seven_day), now: store.now)
+                // Claude Code's /usage lists these as "Current week (Fable)" and refreshes them mainly when
+                // it runs, so each row carries the age of its own numbers.
+                ForEach(store.liveModelWindows) { m in
+                    WindowRow(label: "Weekly (\(m.name))", percent: m.percent, resetsAt: m.resetsAt, now: store.now,
+                              source: "from /usage \(relative(m.fetchedAt, to: store.now))")
+                }
                 Text("Updated \(relative(Date(timeIntervalSince1970: s.captured_at), to: store.now)) by Claude Code")
                     .font(.caption).foregroundStyle(.secondary)
             } else {

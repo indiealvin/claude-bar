@@ -4,8 +4,12 @@ import Foundation
 /// which saves the usage limits and then runs the user's own status line unchanged.
 enum ClaudeSetup {
     // $HOME first, as Claude Code itself resolves ~/.claude.
-    static let claudeDir = (ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
-        ?? FileManager.default.homeDirectoryForCurrentUser).appendingPathComponent(".claude")
+    static let home = ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.homeDirectoryForCurrentUser
+    static let claudeDir = home.appendingPathComponent(".claude")
+    /// Claude Code's own state file. Its cached /usage data is the only place the per-model weekly
+    /// windows (such as Fable) are written, as the status line JSON carries just the 5h and 7d ones.
+    static let claudeJSONURL = home.appendingPathComponent(".claude.json")
     static let settingsURL = claudeDir.appendingPathComponent("settings.json")
     static let hookDir = claudeDir.appendingPathComponent("usagebar")
     // Installed outside the app bundle so the status line keeps working if the app is moved or deleted.
