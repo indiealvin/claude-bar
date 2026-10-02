@@ -100,9 +100,11 @@ It is off by default because it changes what the app touches:
 - It reads the login Claude Code keeps on this Mac, from the Keychain item `Claude Code-credentials`
   through `/usr/bin/security` as Claude Code does, or from `~/.claude/.credentials.json`. The token is
   held in memory for the request and sent only to `api.anthropic.com`.
-- It never renews the login, since that could sign Claude Code out. The login expires after a few hours
-  unless Claude Code on this Mac runs and renews it. Until then the popover says so and shows the other
-  sources.
+- The login expires every few hours. The app doesn't renew it with the refresh token itself, since two
+  programs renewing one login can sign Claude Code out. Instead it runs Claude Code's local `/usage`
+  command (`claude -p /usage --no-session-persistence`), which renews the login through Claude Code's own
+  code and makes no model call, so it costs no usage. This needs `claude` installed on this Mac, but
+  nothing has to be running.
 - The endpoint is the one Claude Code uses internally and isn't documented, so a Claude Code update could
   change it. A 429 from Anthropic pauses fetching for 15 minutes.
 
@@ -128,7 +130,8 @@ The footer shows the build version and commit, for example `v0.1.0 · 2e3bc52`.
 | Waiting for Claude Code | Send a prompt in Claude Code. Sessions that were already open may need restarting to pick up the new status line. |
 | No usage limits reported | Claude Code ran the helper but sent no limits. Sign in with a Pro or Max plan (`/login`) instead of an API key, and update Claude Code. |
 | Error about `settings.json` | The file isn't valid JSON, so claude-bar didn't change it. Fix the file and click **Connect** again. |
-| Claude Code's login on this Mac has expired | Fetching usage directly is on, and the access token it borrows from Claude Code has expired. Run `claude` on this Mac once; fetching resumes within a minute. |
+| Claude Code's login on this Mac has expired and couldn't be renewed | Renewing through `claude -p /usage` failed, or `claude` isn't installed in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin` or on your login shell's PATH. Run `claude` on this Mac once, and `/login` if it asks. Fetching resumes within a minute. |
+| 5-hour row says "Not started" | No 5-hour window is running, because nothing has used Claude since the last one ended. The window starts with your next message. |
 | No *Weekly (Fable)* row | Turn on **Fetch usage every 5 min**, or run `/usage` in Claude Code once. Per-model rows come from the usage data Claude Code caches when `/usage` runs, and only accounts with a per-model weekly limit have one. |
 
 Numbers only update while Claude Code is running. Usage on claude.ai counts toward the same limits, but

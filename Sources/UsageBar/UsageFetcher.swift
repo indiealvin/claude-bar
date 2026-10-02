@@ -4,9 +4,10 @@ import Foundation
 /// Usage belongs to the account, so this stays current while Claude Code runs on another host, where
 /// neither the status line nor the /usage cache on this Mac is updated.
 ///
-/// It only reads Claude Code's access token and never renews it: renewing could replace the login
-/// Claude Code holds and sign it out. Once the token expires, fetching pauses until Claude Code on this
-/// Mac renews it, which it does whenever it runs.
+/// It reads Claude Code's access token but never renews it with the refresh token itself: two programs
+/// renewing one login can sign Claude Code out. When the token has expired, it runs Claude Code's local
+/// /usage command instead (`claude -p /usage`), which makes no model call, so it costs no usage, and
+/// renews the login through Claude Code's own code. Then it reads the token again.
 enum UsageFetcher {
     static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     /// Claude Code refetches at most once a minute; every 5 minutes keeps the load well below that.
@@ -20,7 +21,7 @@ enum UsageFetcher {
         var message: String {
             switch self {
             case .noLogin: return "No Claude Code login found on this Mac. Run claude and /login here once."
-            case .loginExpired: return "Claude Code's login on this Mac has expired. Run claude here once to renew it."
+            case .loginExpired: return "Claude Code's login on this Mac has expired and couldn't be renewed. Run claude here once."
             case .rateLimited: return "Anthropic asked to slow down. Retrying in 15 min."
             case .http(let code): return "Anthropic answered HTTP \(code)."
             case .network(let text): return "Couldn't reach Anthropic: \(text)"
@@ -64,14 +65,87 @@ enum UsageFetcher {
         return Token(accessToken: access, expiresAtMs: oauth["expiresAt"] as? Double)
     }
 
-    /// One fetch. The answer has the same shape as the /usage cache in ~/.claude.json.
-    static func fetch() async -> Result<ClaudeConfig.UsageCache, Failure> {
-        // The Keychain read runs a short subprocess; keep it off the main thread.
-        let token = await Task.detached { readToken() }.value
-        guard let token else { return .failure(.noLogin) }
-        if let expires = token.expiresAtMs, expires / 1000 <= Date().timeIntervalSince1970 {
-            return .failure(.loginExpired)
+    /// Where Claude Code is installed. Apps started from the Dock don't get the shell's PATH, so the
+    /// usual install locations are tried first, then a login shell.
+    static func claudeExecutable() -> URL? {
+        let home = ClaudeSetup.home.path
+        let candidates = ["\(home)/.local/bin/claude", "\(home)/.claude/local/claude",
+                          "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        if let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return URL(fileURLWithPath: path)
         }
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        guard let out = run(URL(fileURLWithPath: shell), ["-lc", "command -v claude"], timeout: 10),
+              let path = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    /// Lets Claude Code renew its own login by running its local /usage command. Returns whether it ran.
+    static func renewLogin() -> Bool {
+        guard let claude = claudeExecutable() else { return false }
+        return run(claude, ["-p", "/usage", "--no-session-persistence"], timeout: 60,
+                   directory: FileManager.default.temporaryDirectory) != nil
+    }
+
+    /// Runs a program and returns its output, or nil if it failed or ran past the timeout.
+    private static func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval,
+                            directory: URL? = nil) -> Data? {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        if let directory { process.currentDirectoryURL = directory }
+        // Run as a top-level Claude Code, not one nested inside another session.
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        process.environment = env
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let timer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        timer.cancel()
+        return process.terminationReason == .exit && process.terminationStatus == 0 ? data : nil
+    }
+
+    private static func isExpired(_ token: Token) -> Bool {
+        // A minute of margin so the request doesn't race the expiry.
+        guard let expires = token.expiresAtMs else { return false }
+        return expires / 1000 <= Date().timeIntervalSince1970 + 60
+    }
+
+    /// A token that is valid now, renewing Claude Code's login first if it has expired.
+    private static func validToken(renewIfExpired: Bool) async -> Result<Token, Failure> {
+        // The Keychain read and the renewal run subprocesses; keep them off the main thread.
+        await Task.detached {
+            guard let token = readToken() else { return .failure(.noLogin) }
+            guard isExpired(token) else { return .success(token) }
+            guard renewIfExpired, renewLogin(), let renewed = readToken(), !isExpired(renewed) else {
+                return .failure(.loginExpired)
+            }
+            return .success(renewed)
+        }.value
+    }
+
+    /// One fetch. The answer has the same shape as the /usage cache in ~/.claude.json. A rejected
+    /// token, which can happen when it was revoked early, gets one renewal and one retry.
+    static func fetch() async -> Result<ClaudeConfig.UsageCache, Failure> {
+        switch await validToken(renewIfExpired: true) {
+        case .failure(let failure): return .failure(failure)
+        case .success(let token):
+            let result = await request(token)
+            guard case .failure(.loginExpired) = result else { return result }
+            let renewed = await Task.detached { renewLogin() ? readToken() : nil }.value
+            guard let renewed, renewed.accessToken != token.accessToken, !isExpired(renewed) else { return result }
+            return await request(renewed)
+        }
+    }
+
+    private static func request(_ token: Token) async -> Result<ClaudeConfig.UsageCache, Failure> {
         var request = URLRequest(url: endpoint, timeoutInterval: 10)
         request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
