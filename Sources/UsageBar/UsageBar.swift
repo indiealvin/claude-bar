@@ -60,6 +60,14 @@ struct ClaudeConfig: Decodable {
         /// The weekly window for all models, "Current week (all models)".
         var sevenDay: Reading? { reading(kind: "weekly_all", bucket: utilization?.seven_day) }
 
+        /// The answer covers the 5-hour window and says none is running: no usage yet since the last
+        /// one ended. The window starts with the next message.
+        var fiveHourIdle: Bool {
+            guard let utilization, fiveHour == nil else { return false }
+            if let row = utilization.limits?.first(where: { $0.kind == "session" }) { return row.resets_at == nil }
+            return utilization.five_hour?.resets_at == nil && (utilization.seven_day != nil || utilization.limits != nil)
+        }
+
         /// The per-model weekly windows, "Current week (<model>)".
         var modelWindows: [ModelWindow] {
             (utilization?.limits ?? []).compactMap { limit in
@@ -216,7 +224,14 @@ final class UsageStore: ObservableObject {
     /// "time of real data": the hook writes only after a reply, and the /usage cache and a direct
     /// fetch are stamped when fetched. The status line measures a few points apart from the other
     /// two, so a row can step by that much when a newer source takes over.
-    var fiveHour: Reading? { newest(readings({ $0.five_hour }, { $0.fiveHour })) }
+    var fiveHour: Reading? { fiveHourIdle ? nil : newest(readings({ $0.five_hour }, { $0.fiveHour })) }
+
+    /// The newest answer that covers the 5-hour window says none is running.
+    var fiveHourIdle: Bool {
+        guard hasData, let usage = newestUsage, usage.fiveHourIdle else { return false }
+        let latest = readings({ $0.five_hour }, { $0.fiveHour }).map(\.at).max() ?? 0
+        return usage.fetchedAt.timeIntervalSince1970 >= latest
+    }
     var sevenDay: Reading? { newest(readings({ $0.seven_day }, { $0.sevenDay })) }
 
     private func newest(_ readings: [(at: TimeInterval, reading: Reading)]) -> Reading? {
@@ -263,10 +278,10 @@ final class UsageStore: ObservableObject {
     }
 
     /// The windows chosen in settings, paired with their short labels.
-    func shown(_ windows: ShownWindows) -> [(label: String, reading: Reading?)] {
-        var out: [(String, Reading?)] = []
-        if windows != .weekly { out.append(("5h", live(fiveHour))) }
-        if windows != .fiveHour { out.append(("7d", live(sevenDay))) }
+    func shown(_ windows: ShownWindows) -> [(label: String, reading: Reading?, idle: Bool)] {
+        var out: [(String, Reading?, Bool)] = []
+        if windows != .weekly { out.append(("5h", live(fiveHour), fiveHourIdle)) }
+        if windows != .fiveHour { out.append(("7d", live(sevenDay), false)) }
         return out
     }
 }
@@ -341,7 +356,7 @@ struct MenuBarLabel: View {
         // icon is drawn into the bars image; otherwise it starts the text.
         HStack(spacing: 4) {
             if hasBars {
-                barsImage(items.map { $0.reading?.percent }, icon: showIcon)
+                barsImage(items.map { $0.idle ? 0 : $0.reading?.percent }, icon: showIcon)
             }
             let label = !hasBars && showIcon ? (text.isEmpty ? "✳︎" : "✳︎ " + text) : text
             if !label.isEmpty {
@@ -350,9 +365,9 @@ struct MenuBarLabel: View {
         }
     }
 
-    private func text(_ items: [(label: String, reading: Reading?)]) -> String {
+    private func text(_ items: [(label: String, reading: Reading?, idle: Bool)]) -> String {
         let parts: [String] = items.compactMap { item in
-            let pct = item.reading.map { "\(Int($0.percent.rounded()))%" } ?? "–"
+            let pct = item.idle ? "0%" : item.reading.map { "\(Int($0.percent.rounded()))%" } ?? "–"
             let countdown = showCountdown ? item.reading.map { " (\(shortCountdown(to: $0.resetsAt, from: store.now)))" } ?? "" : ""
             switch style {
             case .labeled: return "\(item.label) \(pct)\(countdown)"
@@ -451,7 +466,11 @@ struct WindowRow: View {
         self.init(label: label, percent: reading?.percent, resetsAt: reading?.resetsAt, now: now)
     }
 
-    init(label: String, percent: Double?, resetsAt: TimeInterval?, now: Date) {
+    /// Replaces the reset line, e.g. to say a window hasn't started.
+    let note: String?
+
+    init(label: String, percent: Double?, resetsAt: TimeInterval?, now: Date, note: String? = nil) {
+        self.note = note
         self.label = label
         self.percent = percent
         self.resetsAt = resetsAt
@@ -476,6 +495,7 @@ struct WindowRow: View {
     }
 
     private var caption: String {
+        if let note { return note }
         var parts: [String] = []
         if let resetsAt { parts.append("Resets \(relative(Date(timeIntervalSince1970: resetsAt), to: now))") }
         if parts.isEmpty { return percent == nil ? "Window reset or not reported yet" : "No reset time reported" }
@@ -534,7 +554,12 @@ struct UsageMenu: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if store.hasData {
-                WindowRow(label: "5-hour", reading: store.live(store.fiveHour), now: store.now)
+                if store.fiveHourIdle {
+                    WindowRow(label: "5-hour", percent: 0, resetsAt: nil, now: store.now,
+                              note: "Not started. It starts with your next message.")
+                } else {
+                    WindowRow(label: "5-hour", reading: store.live(store.fiveHour), now: store.now)
+                }
                 WindowRow(label: "Weekly", reading: store.live(store.sevenDay), now: store.now)
                 // Only /usage and a direct fetch report these, as "Current week (Fable)".
                 ForEach(store.liveModelWindows) { m in
